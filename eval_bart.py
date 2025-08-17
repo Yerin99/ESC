@@ -24,12 +24,12 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import math
 from typing import Optional
 
 import torch
 from transformers import (
     BartTokenizer,
-    BartForConditionalGeneration,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     DataCollatorForSeq2Seq,
@@ -37,11 +37,17 @@ from transformers import (
 )
 
 from metric.myMetrics import Metric
-from utils.tokens import SPEAKER_TOKENS
+from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
 from utils.stats import compute_word_perplexity_streaming
+from utils.strategy import (
+    DataCollatorWithStrategy,
+    compute_teacher_strategy_report,
+    compute_teacher_strategy_scores,
+)
 
 # Reuse helpers from bart.py to avoid duplication
-from bart import ESConvDataset, build_compute_metrics, CustomTrainer  # type: ignore
+from bart import ESConvDataset, build_compute_metrics, ESCTrainer  # type: ignore
+from models.bart_mtl_strategy import BartForESCWithStrategy
 
 
 def main() -> None:
@@ -53,7 +59,8 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None)
-    parser.add_argument("--max_src_length", type=int, default=1024)
+    # Reserve +1 position for strategy token at inference
+    parser.add_argument("--max_src_length", type=int, default=1023)
     parser.add_argument("--max_tgt_length", type=int, default=256)
 
     # generation params
@@ -65,7 +72,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # logging to both console and logs/bart
+    log_dir = Path("logs/bart")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logfile = log_dir / f"eval_{Path(args.output_dir or args.model_dir or 'eval').__str__().split('/')[-1]}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(logfile, encoding="utf-8")],
+    )
     logger = logging.getLogger("eval_bart")
     set_seed(args.seed)
 
@@ -78,8 +93,9 @@ def main() -> None:
         tokenizer = BartTokenizer.from_pretrained(args.pretrained)
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPEAKER_TOKENS.values())})
 
-    # model
-    model = BartForConditionalGeneration.from_pretrained(args.model_dir or args.pretrained)
+    # model (strategy-aware)
+    model = BartForESCWithStrategy.from_pretrained(args.model_dir or args.pretrained,
+                                                   num_strategies=len(STRATEGY_NAMES))
     model.resize_token_embeddings(len(tokenizer))
 
     # generation config (match bart.py behavior exactly)
@@ -99,7 +115,7 @@ def main() -> None:
         logger.info(f"Using beam search with {args.num_beams} beams.")
     else:
         gen_cfg.num_beams = 1
-        gen_cfg.early_stopping = False  # Turn off for greedy/sampling
+        gen_cfg.early_stopping = False  # ensure unset for non-beam
         if args.top_k > 0 or args.top_p < 1.0:
             gen_cfg.do_sample = True
             gen_cfg.top_k = args.top_k
@@ -117,7 +133,7 @@ def main() -> None:
     test_ds = ESConvDataset(
         "test", tokenizer, max_src=args.max_src_length, max_tgt=args.max_tgt_length, tiny_frac=args.tiny_frac
     )
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
+    data_collator = DataCollatorWithStrategy(tokenizer, model=model, padding="longest")
 
     # trainer for evaluation only
     targs = Seq2SeqTrainingArguments(
@@ -129,7 +145,7 @@ def main() -> None:
         report_to="none",
         seed=args.seed,
     )
-    trainer: Seq2SeqTrainer = CustomTrainer(
+    trainer: Seq2SeqTrainer = ESCTrainer(
         model=model,
         args=targs,
         train_dataset=None,
@@ -143,6 +159,9 @@ def main() -> None:
     trainer.compute_metrics = None
     trainer.args.predict_with_generate = False
     try:
+        # make sure early_stopping is false in non-beam modes
+        if trainer.model.generation_config.num_beams == 1:
+            trainer.model.generation_config.early_stopping = False
         ppl_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
     finally:
         trainer.compute_metrics = original_compute_metrics
@@ -156,7 +175,9 @@ def main() -> None:
 
     # combine and add word-level ppl
     final_test_metrics = {
-        **{k: v for k, v in gen_metrics.items() if k not in ["test_loss", "test_perplexity"]},
+        "test_loss": ppl_metrics.get("test_loss"),
+        "test_perplexity": ppl_metrics.get("test_perplexity", (math.exp(ppl_metrics.get("test_loss")) if ppl_metrics.get("test_loss") is not None else None)),
+        **{k: v for k, v in gen_metrics.items()},
     }
     try:
         test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer, exclude_token_ids=[tokenizer.pad_token_id])
@@ -166,7 +187,23 @@ def main() -> None:
 
     out_dir = Path(args.output_dir or args.model_dir or "outputs/eval_bart")
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items()}, indent=2))
+    # teacher strategy scores
+    try:
+        scores = compute_teacher_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
+        final_test_metrics["test_strategy_acc"] = scores["acc"]
+        final_test_metrics["test_strategy_f1_weighted"] = scores["f1_weighted"]
+    except Exception:
+        pass
+
+    (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items() if v is not None}, indent=2))
+
+    # classification report (teacher strategy)
+    try:
+        rep_str = compute_teacher_strategy_report(trainer, test_ds, STRATEGY_NAMES)
+        (out_dir / "test_strategy_report.txt").write_text(rep_str)
+        logger.info("\nTeacher Strategy Classification Report (test):\n%s", rep_str)
+    except Exception as e:
+        logger.warning("strategy report failed: %s", e)
     logger.info("Test metrics: %s", json.dumps(final_test_metrics, indent=2))
 
     # sample generations
