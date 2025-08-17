@@ -2,7 +2,7 @@
 """
 bart.py
 ==========
-Pure BART training & evaluation script for ESConv (Emotional Support Conversation) **without** strategy tokens.
+BART training & evaluation script for ESConv (Emotional Support Conversation)
 
 사용법 예시
 +------------
@@ -29,10 +29,10 @@ CUDA_VISIBLE_DEVICES=3 python bart.py --top_p 0.9 --output_dir outputs/sample_p_
 bash scripts/run_experiments.sh
 
 핵심 기능
-1. context: `[USR]…` / `[SYS]…` 로 구분, strategy 토큰 제거.
+1. context: `[USR]…` / `[SYS]…` 로 구분
 2. myMetrics 를 활용해 BLEU, Distinct, F1, ROUGE-L 산출.
 3. `--tiny_frac` 로 데이터 일부만 사용해 빠른 테스트 가능.
-4. 체크포인트 저장 생략(`save_strategy='no'`). 결과는 JSON/로그로 출력.
+4. 결과는 JSON/로그로 출력.
 """
 
 import argparse
@@ -42,13 +42,13 @@ import math
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import os
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import (
     BartTokenizer,
-    BartForConditionalGeneration,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     DataCollatorForSeq2Seq,
@@ -60,11 +60,22 @@ from transformers import (
 from utils.stats import compute_word_perplexity_streaming
 
 from metric.myMetrics import Metric
-from utils.tokens import SPEAKER_TOKENS
+from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
+from utils.strategy import (
+    DataCollatorWithStrategy,
+    compute_teacher_strategy_report,
+    compute_teacher_strategy_scores,
+)
+from models.bart_mtl_strategy import BartForESCWithStrategy
 
 # ======================= Dataset =======================
 class ESConvDataset(torch.utils.data.Dataset):
-    """Dataset that builds (context, response) pairs without strategy tokens."""
+    """Dataset that builds (context, response) pairs without strategy tokens.
+
+    Also returns `strategy_labels` for each system turn if `turn["strategy"]` is
+    present in the raw ESConv JSON. Missing labels are set to -100 so the
+    classification loss can ignore them.
+    """
 
     def __init__(
         self,
@@ -87,6 +98,7 @@ class ESConvDataset(torch.utils.data.Dataset):
         eos = f" {tokenizer.eos_token}"
 
         self.examples: List[Dict[str, Any]] = []
+        strat2id = {name: i for i, name in enumerate(STRATEGY_NAMES)}
         for ex in raw:
             dialog = json.loads(ex["text"])["dialog"]
             for turn_idx, turn in enumerate(dialog):
@@ -125,6 +137,11 @@ class ESConvDataset(torch.utils.data.Dataset):
                 if labels and labels[0] == tokenizer.bos_token_id:
                     labels[0] = -100  # mask BOS only; keep EOS to train proper stopping
 
+                # Strategy label always exists for sys turns in ESConv
+                strat_name = turn.get("strategy")
+                assert strat_name in strat2id, f"Unknown strategy name: {strat_name}"
+                strat_label = strat2id[strat_name]
+
                 self.examples.append(
                     {
                         "input_ids": enc.input_ids,
@@ -133,6 +150,7 @@ class ESConvDataset(torch.utils.data.Dataset):
                         # For debugging / sample printing
                         "context": context,
                         "response": turn["text"],
+                        "strategy_labels": strat_label,
                     }
                 )
 
@@ -175,11 +193,47 @@ def int_or_none(value: str) -> Optional[int]:
         raise argparse.ArgumentTypeError(f"Invalid int value or 'None': {value}")
 
 
-# ======================= Custom Trainer for PPL =======================
-class CustomTrainer(Seq2SeqTrainer):
+# ======================= Trainer with PPL + MTL =======================
+class ESCTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer that:
+    - Adds eval perplexity metric
+    - Combines LM loss with strategy CE (label smoothing) during training
+    - Updates model.alpha via epoch-based linear schedule (alpha_start→alpha_end over warmup epochs)
     """
-    A Seq2SeqTrainer that computes and logs perplexity, ensuring it's available for early stopping.
-    """
+
+    def __init__(self, *args,
+                 alpha_start: float = 0.5,
+                 alpha_end: float = 1.0,
+                 alpha_warmup_epochs: float = 2.0,
+                 cls_weight: float = 0.3,
+                 detach_steps: int = 0,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha_start = float(alpha_start)
+        self.alpha_end = float(alpha_end)
+        self.alpha_warmup_epochs = float(alpha_warmup_epochs)
+        self.cls_weight = float(cls_weight)
+        self.detach_steps = int(detach_steps)
+
+    def _update_model_knobs(self):
+        # epoch may be None initially
+        epoch = float(self.state.epoch or 0.0)
+        if self.alpha_warmup_epochs <= 0:
+            ratio = 1.0
+        else:
+            ratio = min(max(epoch / self.alpha_warmup_epochs, 0.0), 1.0)
+        alpha = self.alpha_start + (self.alpha_end - self.alpha_start) * ratio
+        model = self.model
+        # push knobs for current step
+        if hasattr(model, "alpha"):
+            model.alpha = float(alpha)
+        if hasattr(model, "cls_weight"):
+            model.cls_weight = float(self.cls_weight)
+        if hasattr(model, "detach_steps"):
+            model.detach_steps = int(self.detach_steps)
+        if hasattr(model, "global_step"):
+            model.global_step = int(self.state.global_step)
+
     def evaluate(
         self,
         eval_dataset: Optional[torch.utils.data.Dataset] = None,
@@ -187,18 +241,32 @@ class CustomTrainer(Seq2SeqTrainer):
         metric_key_prefix: str = "eval",
         **gen_kwargs,
     ) -> Dict[str, float]:
-        # First, run the parent's evaluate method
+        # Ensure no early_stopping in non-beam/sampling modes to avoid warnings
+        try:
+            if getattr(self.model.generation_config, "num_beams", 1) == 1:
+                self.model.generation_config.early_stopping = False
+        except Exception:
+            pass
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
-        
-        # Then, add perplexity to the metrics dictionary
         loss_key = f"{metric_key_prefix}_loss"
         if loss_key in metrics:
             metrics[f"{metric_key_prefix}_perplexity"] = math.exp(metrics[loss_key])
-            
         return metrics
 
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # type: ignore[override]
+        # Keep strategy labels separate
+        strategy_labels = inputs.pop("strategy_labels", None)
+        self._update_model_knobs()
+        outputs = model(**inputs, strategy_labels=strategy_labels)
 
-# removed local helper
+        lm_loss = outputs.loss
+        total_loss = lm_loss
+        cls_loss = getattr(outputs, "cls_loss", None)
+        if self.model.training and cls_loss is not None:
+            total_loss = lm_loss + (self.cls_weight * cls_loss)
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
 
 # ======================= Main =======================
 
@@ -209,7 +277,8 @@ def main() -> None:  # noqa: D401
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None, help="0~1 range for quick debugging")
-    parser.add_argument("--max_src_length", type=int, default=1024)
+    # Reserve +1 position for strategy token concatenation after encoding
+    parser.add_argument("--max_src_length", type=int, default=1023)
     parser.add_argument("--max_tgt_length", type=int, default=256)
 
     # generation params
@@ -225,9 +294,25 @@ def main() -> None:  # noqa: D401
         help="Enable early stopping with specified patience. Pass 'None' to disable.",
     )
 
+    # ---- Strategy-aware MTL knobs ----
+    parser.add_argument("--num_strategies", type=int, default=8)
+    parser.add_argument("--cls_weight", type=float, default=0.3)
+    parser.add_argument("--alpha_start", type=float, default=0.5)
+    parser.add_argument("--alpha_end", type=float, default=1.0)
+    parser.add_argument("--alpha_warmup_epochs", type=float, default=2.0)
+    parser.add_argument("--detach_steps", type=int, default=0)
+
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # logging to both console and file under logs/bart/
+    log_dir = Path("logs/bart")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logfile = log_dir / f"run_{Path(args.output_dir).name}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(logfile, encoding="utf-8")],
+    )
     logger = logging.getLogger("pure_bart")
     set_seed(args.seed)
 
@@ -235,7 +320,10 @@ def main() -> None:  # noqa: D401
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPEAKER_TOKENS.values())})
 
-    model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+    model = BartForESCWithStrategy.from_pretrained(
+        "facebook/bart-base",
+        num_strategies=args.num_strategies or len(STRATEGY_NAMES),
+    )
     model.resize_token_embeddings(len(tokenizer))
 
     # generation config:
@@ -257,7 +345,7 @@ def main() -> None:  # noqa: D401
         logger.info(f"Using beam search with {args.num_beams} beams.")
     else:
         gen_cfg.num_beams = 1
-        gen_cfg.early_stopping = False  # Turn off for greedy/sampling
+        gen_cfg.early_stopping = False  # ensure unset for non-beam
         if args.top_k > 0 or args.top_p < 1.0:
             gen_cfg.do_sample = True
             gen_cfg.top_k = args.top_k
@@ -294,7 +382,7 @@ def main() -> None:  # noqa: D401
         tiny_frac=args.tiny_frac,
     )
 
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
+    data_collator = DataCollatorWithStrategy(tokenizer, model=model, padding="longest")
 
     # -------------------- trainer --------------------
     training_args = Seq2SeqTrainingArguments(
@@ -316,7 +404,7 @@ def main() -> None:  # noqa: D401
         load_best_model_at_end=True,
     )
 
-    trainer = CustomTrainer(
+    trainer = ESCTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -324,16 +412,69 @@ def main() -> None:  # noqa: D401
         data_collator=data_collator,
         compute_metrics=build_compute_metrics(tokenizer),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if args.early_stopping_patience else [],
+        alpha_start=args.alpha_start,
+        alpha_end=args.alpha_end,
+        alpha_warmup_epochs=args.alpha_warmup_epochs,
+        cls_weight=args.cls_weight,
+        detach_steps=args.detach_steps,
     )
+
+    # Optional: allow switching to pure ground-truth strategy token mixing via env/flag
+    if int(os.environ.get("ESC_USE_GT_STRATEGY", "0")) == 1:
+        try:
+            model.use_ground_truth_strategy = True
+            logger.info("Using ground-truth strategy for mixture token (pure one-hot).")
+        except Exception:
+            pass
+
+    # -------------------- optional init eval (epoch 0) --------------------
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("📊 Evaluating initial model (epoch 0)…")
+    original_compute_metrics = trainer.compute_metrics
+    trainer.compute_metrics = None
+    trainer.args.predict_with_generate = False
+    try:
+        init_ppl = trainer.evaluate(eval_dataset=val_ds, metric_key_prefix="init_eval")
+    finally:
+        trainer.compute_metrics = original_compute_metrics
+        trainer.args.predict_with_generate = True
+    init_gen = trainer.evaluate(eval_dataset=val_ds, metric_key_prefix="init_eval")
+    # combine like normal eval: include loss/perplexity and generation metrics
+    init_metrics = {
+        "init_eval_loss": init_ppl.get("init_eval_loss"),
+        "init_eval_perplexity": init_ppl.get("init_eval_perplexity", (math.exp(init_ppl.get("init_eval_loss")) if init_ppl.get("init_eval_loss") is not None else None)),
+        **{k: v for k, v in init_gen.items()},
+    }
+    try:
+        init_w_ppl = compute_word_perplexity_streaming(trainer, val_ds, tokenizer,
+                                                       exclude_token_ids=[tokenizer.pad_token_id])
+        init_metrics["init_eval_word_perplexity"] = float(init_w_ppl)
+    except Exception:
+        pass
+    # strategy scores (teacher)
+    try:
+        strat_scores_init = compute_teacher_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
+        init_metrics["init_eval_strategy_acc"] = strat_scores_init["acc"]
+        init_metrics["init_eval_strategy_f1_weighted"] = strat_scores_init["f1_weighted"]
+    except Exception:
+        pass
+    (out_dir / "init_val_metrics.json").write_text(json.dumps({k: float(v) for k, v in init_metrics.items() if v is not None}, indent=2))
+    try:
+        rep_init = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        (out_dir / "init_val_strategy_report.txt").write_text(rep_init)
+        logger.info("\nTeacher Strategy Classification Report (init validation):\n%s", rep_init)
+    except Exception:
+        pass
 
     # -------------------- train & eval --------------------
     logger.info("✅ Starting training…")
     trainer.train()
 
     logger.info("📊 Evaluating on validation set…")
-    # The original `trainer.evaluate()` uses `predict_with_generate=True` from TrainingArguments,
-    # which does not yield the correct cross-entropy loss for PPL.
-    # We must evaluate in two steps, just like for the test set.
+    # The original evaluate uses predict_with_generate=True, which prevents CE-based ppl.
+    # Evaluate in two steps (teacher forcing -> generation) as before.
 
     # 1. PPL calculation (teacher forcing)
     original_compute_metrics = trainer.compute_metrics
@@ -351,13 +492,20 @@ def main() -> None:  # noqa: D401
         trainer.model.generation_config.length_penalty = 1.0
     gen_metrics_val = trainer.evaluate(eval_dataset=val_ds, metric_key_prefix="eval")
 
-    # 3. Combine and log validation metrics
+    # 3. Combine and log validation metrics (preserve loss+ppl and add gen metrics)
     eval_metrics = {
         "eval_loss": ppl_metrics_val.get("eval_loss"),
-        "eval_perplexity": ppl_metrics_val.get("eval_perplexity"),
-        **{k: v for k, v in gen_metrics_val.items() if k not in ["eval_loss", "eval_perplexity"]},
+        "eval_perplexity": ppl_metrics_val.get("eval_perplexity", (math.exp(ppl_metrics_val.get("eval_loss")) if ppl_metrics_val.get("eval_loss") is not None else None)),
+        **{k: v for k, v in gen_metrics_val.items()},
     }
     logger.info("Validation metrics: %s", json.dumps(eval_metrics, indent=2))
+
+    # Strategy classification report on validation set (teacher)
+    try:
+        rep_str = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        logger.info("\nTeacher Strategy Classification Report (validation):\n%s", rep_str)
+    except Exception as e:
+        logger.warning("strategy report (val) failed: %s", e)
 
     # word-level perplexity (streaming over eval dataloader)
     try:
@@ -370,47 +518,77 @@ def main() -> None:  # noqa: D401
     # -------------------- save metrics & run test --------------------
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Save without BPE-level loss/perplexity to avoid confusion
-    _save_eval = {k: float(v) for k, v in eval_metrics.items() if k not in ["eval_loss", "eval_perplexity"]}
+    # Strategy accuracy/F1 (teacher)
+    try:
+        strat_scores_val = compute_teacher_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
+        eval_metrics["eval_strategy_acc"] = strat_scores_val["acc"]
+        eval_metrics["eval_strategy_f1_weighted"] = strat_scores_val["f1_weighted"]
+    except Exception:
+        pass
+
+    _save_eval = {k: float(v) for k, v in eval_metrics.items() if v is not None}
     (out_dir / "val_metrics.json").write_text(json.dumps(_save_eval, indent=2))
+    # Save validation strategy report as text for reproducibility
+    try:
+        rep_str_val = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        (out_dir / "val_strategy_report.txt").write_text(rep_str_val)
+    except Exception:
+        pass
 
     logger.info("🧪 Evaluating on test set…")
-    # 1. PPL calculation (teacher forcing)
-    #    Temporarily disable compute_metrics for this step, as it expects generated tokens, not logits.
+    # 1. Teacher-forcing PPL
     original_compute_metrics = trainer.compute_metrics
     trainer.compute_metrics = None
     trainer.args.predict_with_generate = False
     try:
         ppl_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
     finally:
-        # Restore the original state
         trainer.compute_metrics = original_compute_metrics
         trainer.args.predict_with_generate = True
     
-    # 2. Generation metrics (autoregressive)
-    # Explicitly disable early_stopping for non-beam-search generation to prevent warnings
+    # 2. Generation metrics
     if trainer.model.generation_config.num_beams == 1:
         trainer.model.generation_config.early_stopping = False
         trainer.model.generation_config.length_penalty = 1.0
     gen_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
 
     # 3. Combine metrics and save (add word-level ppl before writing)
-    final_test_metrics = {**{k: v for k, v in gen_metrics.items() if k not in ["test_loss", "test_perplexity"]}}
+    # Include loss/perplexity explicitly
+    final_test_metrics = {
+        "test_loss": ppl_metrics.get("test_loss"),
+        "test_perplexity": ppl_metrics.get("test_perplexity", (math.exp(ppl_metrics.get("test_loss")) if ppl_metrics.get("test_loss") is not None else None)),
+        **{k: v for k, v in gen_metrics.items()},
+    }
     try:
         test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer,
                                                        exclude_token_ids=[tokenizer.pad_token_id])
         final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
     except Exception:
         pass
+    # strategy acc/f1 (teacher)
+    try:
+        strat_scores_test = compute_teacher_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
+        final_test_metrics["test_strategy_acc"] = strat_scores_test["acc"]
+        final_test_metrics["test_strategy_f1_weighted"] = strat_scores_test["f1_weighted"]
+    except Exception:
+        pass
+
     logger.info("Test metrics: %s", json.dumps(final_test_metrics, indent=2))
-    (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items()}, indent=2))
+    (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items() if v is not None}, indent=2))
+
+    # Strategy classification report on test set
+    try:
+        rep_str_test = compute_teacher_strategy_report(trainer, test_ds, STRATEGY_NAMES)
+        (out_dir / "test_strategy_report.txt").write_text(rep_str_test)
+        logger.info("\nTeacher Strategy Classification Report (test):\n%s", rep_str_test)
+    except Exception as e:
+        logger.warning("strategy report (test) failed: %s", e)
 
     # -------------------- sample generations --------------------
     sample_n = 5
     indices = random.sample(range(len(val_ds)), min(sample_n, len(val_ds)))
     model.eval()
 
-    # Ensure generation config is correct before generating samples
     if model.generation_config.num_beams == 1:
         model.generation_config.early_stopping = False
         model.generation_config.length_penalty = 1.0
