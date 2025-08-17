@@ -1,0 +1,23 @@
+1) α=0.0 고정(=GT 혼합과 동일 효과)
+CUDA_VISIBLE_DEVICES=1 python bart.py \
+  --epochs 10 --top_p 0.9 \
+  --alpha_start 0.0 --alpha_end 0.0 --alpha_warmup_epochs 0.0 \
+  --output_dir outputs/alpha0_top_p09
+
+2) warm‑up(0.5 → 1.0, 2 에폭 선형 증가, 예: 초반 2k step detach)
+CUDA_VISIBLE_DEVICES=2 python bart.py \
+  --epochs 10 --top_p 0.9 \
+  --alpha_start 0.5 --alpha_end 1.0 --alpha_warmup_epochs 2.0 \
+  --detach_steps 2000 \
+  --output_dir outputs/warmup_alpha_top_p09
+
+3) α=1.0 고정(분류기 확률만 사용)
+CUDA_VISIBLE_DEVICES=3 python bart.py \
+  --epochs 10 --top_p 0.9 \
+  --alpha_start 1.0 --alpha_end 1.0 --alpha_warmup_epochs 0.0 \
+  --output_dir outputs/alpha1_top_p09
+
+4) GT 전략 강제(가장 단순한 GT 학습)
+ESC_USE_GT_STRATEGY=1 CUDA_VISIBLE_DEVICES=1 python bart.py \
+  --epochs 10 --top_p 0.9 \
+  --output_dir outputs/gt_strategy_top_p09
