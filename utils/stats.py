@@ -48,8 +48,12 @@ def compute_word_perplexity_streaming(trainer, dataset, tokenizer: PreTrainedTok
                                       exclude_token_ids: Optional[Sequence[int]] = None) -> float:
     """Compute word-level PPL by streaming over eval dataloader with logits.
 
-    - Excludes pad(-100) and optionally BOS/EOS etc. from NLL accumulation
-    - Avoids storing all logits in memory
+    Notes on correctness:
+    - Standard perplexity in NLP is subword-level: exp(average NLL over non-ignored target tokens).
+      Our training/eval loop computes this via `exp(eval_loss)` and exposes it as `*_perplexity`.
+    - This function returns an approximate word-level PPL by dividing accumulated token-level NLL by
+      the number of reference words measured with a robust tokenizer fallback. It is useful for
+      cross-paper comparison but should not replace the standard subword PPL.
     """
     import math
     import torch
