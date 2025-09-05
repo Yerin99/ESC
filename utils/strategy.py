@@ -4,8 +4,7 @@ utils/strategy.py
 ------------------
 Reusable helpers for strategy-aware training/evaluation:
 - DataCollatorWithStrategy: adds `strategy_labels` tensor to batches
-- compute_teacher_strategy_report: runs encoder strategy head on validation/test set
-  and returns sklearn classification_report (string).
+- compute_strategy_report: run encoder CLS strategy head and return sklearn classification_report
 """
 
 from __future__ import annotations
@@ -25,12 +24,10 @@ class DataCollatorWithStrategy(DataCollatorForSeq2Seq):
         return batch
 
 
-def compute_teacher_strategy_report(trainer, dataset, strategy_names: List[str]) -> str:
-    """Compute classification_report for teacher (encoder strategy head).
+def compute_strategy_report(trainer, dataset, strategy_names: List[str]) -> str:
+    """Compute classification_report for encoder CLS-based strategy predictions.
 
-    The teacher head is applied to pooled BOS hidden states for each example. Ground truth
-    labels come from `dataset.examples[i]["strategy_labels"]`.
-    Returns a string from sklearn.metrics.classification_report.
+    Labels come from `dataset.examples[i]["strategy_labels"]`.
     """
     model = trainer.model
     device = model.device
@@ -60,11 +57,8 @@ def compute_teacher_strategy_report(trainer, dataset, strategy_names: List[str])
                                  target_names=strategy_names, digits=3, zero_division=0)
 
 
-def compute_teacher_strategy_scores(trainer, dataset, strategy_names: List[str]) -> dict:
-    """Return numeric metrics for teacher strategy prediction: accuracy and weighted F1.
-
-    Returns a dict {"acc": float, "f1_weighted": float}.
-    """
+def compute_strategy_scores(trainer, dataset, strategy_names: List[str]) -> dict:
+    """Return accuracy and weighted-F1 for encoder CLS-based strategy prediction."""
     model = trainer.model
     device = model.device
 
@@ -92,5 +86,9 @@ def compute_teacher_strategy_scores(trainer, dataset, strategy_names: List[str])
         "acc": float(accuracy_score(y_true_f, y_pred_f)),
         "f1_weighted": float(f1_score(y_true_f, y_pred_f, average="weighted", zero_division=0)),
     }
+
+# Backward-compat aliases (safe to keep temporarily)
+compute_teacher_strategy_report = compute_strategy_report
+compute_teacher_strategy_scores = compute_strategy_scores
 
 

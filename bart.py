@@ -63,8 +63,8 @@ from metric.myMetrics import Metric
 from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
 from utils.strategy import (
     DataCollatorWithStrategy,
-    compute_teacher_strategy_report,
-    compute_teacher_strategy_scores,
+    compute_strategy_report,
+    compute_strategy_scores,
 )
 from models.bart_mtl_strategy import BartForESCWithStrategy
 
@@ -453,18 +453,18 @@ def main() -> None:  # noqa: D401
         init_metrics["init_eval_word_perplexity"] = float(init_w_ppl)
     except Exception:
         pass
-    # strategy scores (teacher)
+    # strategy scores
     try:
-        strat_scores_init = compute_teacher_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
+        strat_scores_init = compute_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
         init_metrics["init_eval_strategy_acc"] = strat_scores_init["acc"]
         init_metrics["init_eval_strategy_f1_weighted"] = strat_scores_init["f1_weighted"]
     except Exception:
         pass
     (out_dir / "init_val_metrics.json").write_text(json.dumps({k: float(v) for k, v in init_metrics.items() if v is not None}, indent=2))
     try:
-        rep_init = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        rep_init = compute_strategy_report(trainer, val_ds, STRATEGY_NAMES)
         (out_dir / "init_val_strategy_report.txt").write_text(rep_init)
-        logger.info("\nTeacher Strategy Classification Report (init validation):\n%s", rep_init)
+        logger.info("\nStrategy Classification Report (init validation):\n%s", rep_init)
     except Exception:
         pass
 
@@ -500,10 +500,10 @@ def main() -> None:  # noqa: D401
     }
     logger.info("Validation metrics: %s", json.dumps(eval_metrics, indent=2))
 
-    # Strategy classification report on validation set (teacher)
+    # Strategy classification report on validation set
     try:
-        rep_str = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
-        logger.info("\nTeacher Strategy Classification Report (validation):\n%s", rep_str)
+        rep_str = compute_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        logger.info("\nStrategy Classification Report (validation):\n%s", rep_str)
     except Exception as e:
         logger.warning("strategy report (val) failed: %s", e)
 
@@ -518,9 +518,9 @@ def main() -> None:  # noqa: D401
     # -------------------- save metrics & run test --------------------
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Strategy accuracy/F1 (teacher)
+    # Strategy accuracy/F1
     try:
-        strat_scores_val = compute_teacher_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
+        strat_scores_val = compute_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
         eval_metrics["eval_strategy_acc"] = strat_scores_val["acc"]
         eval_metrics["eval_strategy_f1_weighted"] = strat_scores_val["f1_weighted"]
     except Exception:
@@ -530,7 +530,7 @@ def main() -> None:  # noqa: D401
     (out_dir / "val_metrics.json").write_text(json.dumps(_save_eval, indent=2))
     # Save validation strategy report as text for reproducibility
     try:
-        rep_str_val = compute_teacher_strategy_report(trainer, val_ds, STRATEGY_NAMES)
+        rep_str_val = compute_strategy_report(trainer, val_ds, STRATEGY_NAMES)
         (out_dir / "val_strategy_report.txt").write_text(rep_str_val)
     except Exception:
         pass
@@ -565,9 +565,9 @@ def main() -> None:  # noqa: D401
         final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
     except Exception:
         pass
-    # strategy acc/f1 (teacher)
+    # strategy acc/f1
     try:
-        strat_scores_test = compute_teacher_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
+        strat_scores_test = compute_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
         final_test_metrics["test_strategy_acc"] = strat_scores_test["acc"]
         final_test_metrics["test_strategy_f1_weighted"] = strat_scores_test["f1_weighted"]
     except Exception:
@@ -578,9 +578,9 @@ def main() -> None:  # noqa: D401
 
     # Strategy classification report on test set
     try:
-        rep_str_test = compute_teacher_strategy_report(trainer, test_ds, STRATEGY_NAMES)
+        rep_str_test = compute_strategy_report(trainer, test_ds, STRATEGY_NAMES)
         (out_dir / "test_strategy_report.txt").write_text(rep_str_test)
-        logger.info("\nTeacher Strategy Classification Report (test):\n%s", rep_str_test)
+        logger.info("\nStrategy Classification Report (test):\n%s", rep_str_test)
     except Exception as e:
         logger.warning("strategy report (test) failed: %s", e)
 

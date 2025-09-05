@@ -41,8 +41,8 @@ from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
 from utils.stats import compute_word_perplexity_streaming
 from utils.strategy import (
     DataCollatorWithStrategy,
-    compute_teacher_strategy_report,
-    compute_teacher_strategy_scores,
+    compute_strategy_report,
+    compute_strategy_scores,
 )
 
 # Reuse helpers from bart.py to avoid duplication
@@ -187,9 +187,9 @@ def main() -> None:
 
     out_dir = Path(args.output_dir or args.model_dir or "outputs/eval_bart")
     out_dir.mkdir(parents=True, exist_ok=True)
-    # teacher strategy scores
+    # strategy scores
     try:
-        scores = compute_teacher_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
+        scores = compute_strategy_scores(trainer, test_ds, STRATEGY_NAMES)
         final_test_metrics["test_strategy_acc"] = scores["acc"]
         final_test_metrics["test_strategy_f1_weighted"] = scores["f1_weighted"]
     except Exception:
@@ -197,11 +197,11 @@ def main() -> None:
 
     (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items() if v is not None}, indent=2))
 
-    # classification report (teacher strategy)
+    # classification report (encoder strategy)
     try:
-        rep_str = compute_teacher_strategy_report(trainer, test_ds, STRATEGY_NAMES)
+        rep_str = compute_strategy_report(trainer, test_ds, STRATEGY_NAMES)
         (out_dir / "test_strategy_report.txt").write_text(rep_str)
-        logger.info("\nTeacher Strategy Classification Report (test):\n%s", rep_str)
+        logger.info("\nStrategy Classification Report (test):\n%s", rep_str)
     except Exception as e:
         logger.warning("strategy report failed: %s", e)
     logger.info("Test metrics: %s", json.dumps(final_test_metrics, indent=2))
