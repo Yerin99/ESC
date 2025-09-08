@@ -57,7 +57,6 @@ from transformers import (
     TrainerCallback,
 )
 # Shared utility
-from utils.stats import compute_word_perplexity_streaming
 
 from metric.myMetrics import Metric
 from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
@@ -66,7 +65,7 @@ from utils.strategy import (
     compute_strategy_report,
     compute_strategy_scores,
 )
-from models.bart_mtl_strategy import BartForESCWithStrategy
+from models.bart_mtl_strategy import BartForESCWithStrategyDualAttn
 
 # ======================= Dataset =======================
 class ESConvDataset(torch.utils.data.Dataset):
@@ -132,10 +131,11 @@ class ESConvDataset(torch.utils.data.Dataset):
                     add_special_tokens=True,
                 )
 
-                # Mask BOS/EOS in labels to avoid overly optimistic loss/PPL
+                # Masking for fair CE/PPL: ignore PAD and BOS in labels; keep EOS
                 labels = list(dec.input_ids)
-                if labels and labels[0] == tokenizer.bos_token_id:
-                    labels[0] = -100  # mask BOS only; keep EOS to train proper stopping
+                labels = [(-100 if tok == tokenizer.pad_token_id else tok) for tok in labels]
+                if labels and dec.input_ids[0] == tokenizer.bos_token_id:
+                    labels[0] = -100
 
                 # Strategy label always exists for sys turns in ESConv
                 strat_name = turn.get("strategy")
@@ -273,12 +273,12 @@ class ESCTrainer(Seq2SeqTrainer):
 def main() -> None:  # noqa: D401
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="outputs/pure_bart_esconv")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None, help="0~1 range for quick debugging")
-    # Reserve +1 position for strategy token concatenation after encoding
-    parser.add_argument("--max_src_length", type=int, default=1023)
+    # Use full source length; no extra token concatenation
+    parser.add_argument("--max_src_length", type=int, default=1024)
     parser.add_argument("--max_tgt_length", type=int, default=256)
 
     # generation params
@@ -320,7 +320,7 @@ def main() -> None:  # noqa: D401
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPEAKER_TOKENS.values())})
 
-    model = BartForESCWithStrategy.from_pretrained(
+    model = BartForESCWithStrategyDualAttn.from_pretrained(
         "facebook/bart-base",
         num_strategies=args.num_strategies or len(STRATEGY_NAMES),
     )
@@ -357,6 +357,9 @@ def main() -> None:  # noqa: D401
             logger.info("Using greedy search.")
 
     model.generation_config = gen_cfg
+    # 안전성을 위해 dual-attn 초기 버전에서는 캐시를 비활성화 (속도 영향만, 정확도 동일)
+    model.generation_config.use_cache = False
+    model.config.use_cache = False
 
     # -------------------- datasets --------------------
     logger.info("Loading datasets…")
@@ -447,12 +450,7 @@ def main() -> None:  # noqa: D401
         "init_eval_perplexity": init_ppl.get("init_eval_perplexity", (math.exp(init_ppl.get("init_eval_loss")) if init_ppl.get("init_eval_loss") is not None else None)),
         **{k: v for k, v in init_gen.items()},
     }
-    try:
-        init_w_ppl = compute_word_perplexity_streaming(trainer, val_ds, tokenizer,
-                                                       exclude_token_ids=[tokenizer.pad_token_id])
-        init_metrics["init_eval_word_perplexity"] = float(init_w_ppl)
-    except Exception:
-        pass
+    # word-level PPL removed (non-standard and slow)
     # strategy scores
     try:
         strat_scores_init = compute_strategy_scores(trainer, val_ds, STRATEGY_NAMES)
@@ -508,12 +506,7 @@ def main() -> None:  # noqa: D401
         logger.warning("strategy report (val) failed: %s", e)
 
     # word-level perplexity (streaming over eval dataloader)
-    try:
-        eval_w_ppl = compute_word_perplexity_streaming(trainer, val_ds, tokenizer,
-                                                       exclude_token_ids=[tokenizer.pad_token_id])
-        eval_metrics["eval_word_perplexity"] = float(eval_w_ppl)
-    except Exception:
-        pass
+    # word-level PPL removed (non-standard and slow)
 
     # -------------------- save metrics & run test --------------------
     out_dir = Path(args.output_dir)
@@ -559,12 +552,7 @@ def main() -> None:  # noqa: D401
         "test_perplexity": ppl_metrics.get("test_perplexity", (math.exp(ppl_metrics.get("test_loss")) if ppl_metrics.get("test_loss") is not None else None)),
         **{k: v for k, v in gen_metrics.items()},
     }
-    try:
-        test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer,
-                                                       exclude_token_ids=[tokenizer.pad_token_id])
-        final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
-    except Exception:
-        pass
+    # word-level PPL removed (non-standard and slow)
     # strategy acc/f1
     try:
         strat_scores_test = compute_strategy_scores(trainer, test_ds, STRATEGY_NAMES)

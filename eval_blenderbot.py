@@ -28,7 +28,6 @@ from transformers import (
 
 from metric.myMetrics import Metric
 from utils.tokens import SPEAKER_TOKENS
-from utils.stats import compute_word_perplexity_streaming
 
 from blenderbot import ESConvDataset, build_compute_metrics, CustomTrainer  # type: ignore
 
@@ -140,11 +139,6 @@ def main() -> None:
     final_test_metrics = {
         **{k: v for k, v in gen_metrics.items() if k not in ["test_loss", "test_perplexity"]},
     }
-    try:
-        test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer, exclude_token_ids=[tokenizer.pad_token_id])
-        final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
-    except Exception:
-        pass
 
     out_dir = Path(args.output_dir or args.model_dir or "outputs/eval_blenderbot")
     out_dir.mkdir(parents=True, exist_ok=True)

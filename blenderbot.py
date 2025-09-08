@@ -50,7 +50,6 @@ from transformers import (
     EarlyStoppingCallback,
     TrainerCallback,
 )
-from utils.stats import compute_word_perplexity_streaming
 
 from metric.myMetrics import Metric
 from utils.tokens import SPEAKER_TOKENS
@@ -341,13 +340,7 @@ def main() -> None:  # noqa: D401
     }
     logger.info("Validation metrics: %s", json.dumps(eval_metrics, indent=2))
 
-    # word-level ppl via streaming before saving
-    try:
-        eval_w_ppl = compute_word_perplexity_streaming(trainer, val_ds, tokenizer,
-                                                       exclude_token_ids=[tokenizer.pad_token_id])
-        eval_metrics["eval_word_perplexity"] = float(eval_w_ppl)
-    except Exception:
-        pass
+    # word-level PPL removed (non-standard and slow)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     _save_eval = {k: float(v) for k, v in eval_metrics.items() if k not in ["eval_loss", "eval_perplexity"]}
@@ -370,14 +363,8 @@ def main() -> None:  # noqa: D401
         trainer.model.generation_config.length_penalty = 1.0
     gen_metrics = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
 
-    # 3. Combine metrics and save (add word-level ppl, exclude BPE-level loss/ppl)
+    # 3. Combine metrics and save (exclude BPE-level loss/ppl)
     final_test_metrics = {**{k: v for k, v in gen_metrics.items() if k not in ["test_loss", "test_perplexity"]}}
-    try:
-        test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer,
-                                                       exclude_token_ids=[tokenizer.pad_token_id])
-        final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
-    except Exception:
-        pass
     logger.info("Test metrics: %s", json.dumps(final_test_metrics, indent=2))
     (out_dir / "test_metrics.json").write_text(json.dumps({k: float(v) for k, v in final_test_metrics.items()}, indent=2))
 

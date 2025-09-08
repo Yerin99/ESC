@@ -38,7 +38,6 @@ from transformers import (
 
 from metric.myMetrics import Metric
 from utils.tokens import SPEAKER_TOKENS, STRATEGY_NAMES
-from utils.stats import compute_word_perplexity_streaming
 from utils.strategy import (
     DataCollatorWithStrategy,
     compute_strategy_report,
@@ -47,7 +46,7 @@ from utils.strategy import (
 
 # Reuse helpers from bart.py to avoid duplication
 from bart import ESConvDataset, build_compute_metrics, ESCTrainer  # type: ignore
-from models.bart_mtl_strategy import BartForESCWithStrategy
+from models.bart_mtl_strategy import BartForESCWithStrategyDualAttn
 
 
 def main() -> None:
@@ -59,8 +58,8 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None)
-    # Reserve +1 position for strategy token at inference
-    parser.add_argument("--max_src_length", type=int, default=1023)
+    # No extra token concatenation; keep original source budget
+    parser.add_argument("--max_src_length", type=int, default=1024)
     parser.add_argument("--max_tgt_length", type=int, default=256)
 
     # generation params
@@ -94,8 +93,10 @@ def main() -> None:
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPEAKER_TOKENS.values())})
 
     # model (strategy-aware)
-    model = BartForESCWithStrategy.from_pretrained(args.model_dir or args.pretrained,
-                                                   num_strategies=len(STRATEGY_NAMES))
+    model = BartForESCWithStrategyDualAttn.from_pretrained(
+        args.model_dir or args.pretrained,
+        num_strategies=len(STRATEGY_NAMES),
+    )
     model.resize_token_embeddings(len(tokenizer))
 
     # generation config (match bart.py behavior exactly)
@@ -128,6 +129,9 @@ def main() -> None:
             gen_cfg.do_sample = False
             logger.info("Using greedy search.")
     model.generation_config = gen_cfg
+    # dual-attn 경로 안정화를 위해 캐시 비활성화
+    model.generation_config.use_cache = False
+    model.config.use_cache = False
 
     # dataset
     test_ds = ESConvDataset(
@@ -179,11 +183,7 @@ def main() -> None:
         "test_perplexity": ppl_metrics.get("test_perplexity", (math.exp(ppl_metrics.get("test_loss")) if ppl_metrics.get("test_loss") is not None else None)),
         **{k: v for k, v in gen_metrics.items()},
     }
-    try:
-        test_w_ppl = compute_word_perplexity_streaming(trainer, test_ds, tokenizer, exclude_token_ids=[tokenizer.pad_token_id])
-        final_test_metrics["test_word_perplexity"] = float(test_w_ppl)
-    except Exception:
-        pass
+    # word-level PPL removed (non-standard and slow)
 
     out_dir = Path(args.output_dir or args.model_dir or "outputs/eval_bart")
     out_dir.mkdir(parents=True, exist_ok=True)
