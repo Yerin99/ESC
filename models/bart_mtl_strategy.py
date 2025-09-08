@@ -5,13 +5,13 @@ models/bart_mtl_strategy.py
 Strategy-aware BART wrapper for ESConv with:
 - CLS pooling from BOS (default) or EOS
 - A strategy classification head on top of encoder CLS
-- Mixture strategy embedding appended as an extra encoder token (mask +1)
+- Mixture strategy embedding computed from strategy distribution p, but NOT concatenated to encoder outputs (to enable future MISC-style separate cross-attention)
 - Alpha-controlled mixture during training, with optional detachment for stability
 - Returns LM loss (from parent) and cls_loss (for trainer to combine)
 
 본 모듈은 `Seq2SeqTrainer(predict_with_generate=True)`와 완전히 호환되도록 설계되었고,
 generate() 경로에서도 `prepare_encoder_decoder_kwargs_for_generation`를 오버라이드하여
-인코더 출력 뒤에 전략 임베딩 토큰을 붙이고 mask도 +1 하도록 한다.
+전략 분포/벡터만 계산해 전달하며, 인코더 출력 뒤에 토큰을 더 이상 붙이지 않는다.
 """
 
 from __future__ import annotations
@@ -23,6 +23,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BartForConditionalGeneration
+from transformers.models.bart.modeling_bart import (
+    BartDecoderLayer,
+    BartAttention,
+)
+from transformers.activations import ACT2FN
+import copy
 from transformers.modeling_outputs import Seq2SeqLMOutput
 
 
@@ -97,18 +103,15 @@ class BartForESCWithStrategy(BartForConditionalGeneration):
         last_hidden = encoder_outputs.last_hidden_state
         h_cls = self._pool_bos(last_hidden)
 
-        # Strategy probs and mixture token (inference: alpha=1.0 effectively)
         logits_s = self.strategy_head(h_cls)
         p_s = torch.softmax(logits_s, dim=-1)
         e_mix = torch.matmul(p_s, self.strategy_embeddings.weight)
 
-        # Append token and grow mask(+1)
-        encoder_outputs, attention_mask = self._append_strategy_token(encoder_outputs, attention_mask, e_mix)
-
+        # Do NOT append e_mix to encoder outputs anymore. Keep lengths unchanged.
         model_kwargs["encoder_outputs"] = encoder_outputs
         model_kwargs["attention_mask"] = attention_mask
-        # Flag to avoid double-appending inside forward() during generation
-        model_kwargs["strategy_appended"] = True
+        # Expose strategy vector for potential downstream usage (e.g., custom cross-attn)
+        model_kwargs["strategy_vector"] = e_mix
         return model_kwargs
 
     # --------- forward override ---------
@@ -181,35 +184,14 @@ class BartForESCWithStrategy(BartForConditionalGeneration):
         else:
             p_for_token = p_mix
 
-        # 6) Build e_mix token and append to encoder outputs; grow mask(+1)
+        # 6) Build e_mix vector (not appended). Keep for potential auxiliary uses.
         assert attention_mask is not None, "attention_mask is required"
-        enc_len = encoder_outputs.last_hidden_state.size(1)
-        mask_len = attention_mask.size(1)
-        if enc_len == mask_len:
-            # Training/teacher-forcing path: append both hidden and mask
-            e_mix = torch.matmul(p_for_token, self.strategy_embeddings.weight)  # [B,d]
-            encoder_outputs, attention_mask_plus = self._append_strategy_token(encoder_outputs, attention_mask, e_mix)
-        elif enc_len + 1 == mask_len:
-            # Mask already extended (e.g., prepare_* extended mask but not hidden). Append hidden only.
-            e_mix = torch.matmul(p_for_token, self.strategy_embeddings.weight)  # [B,d]
-            h_enc = encoder_outputs.last_hidden_state
-            h_plus = torch.cat([h_enc, e_mix.unsqueeze(1)], dim=1)
-            encoder_outputs.last_hidden_state = h_plus
-            attention_mask_plus = attention_mask  # keep as provided
-        elif enc_len == mask_len + 1:
-            # Hidden already extended (should be rare). Trim hidden to match mask for safety.
-            encoder_outputs.last_hidden_state = encoder_outputs.last_hidden_state[:, :mask_len, :]
-            attention_mask_plus = attention_mask
-        else:
-            # Unexpected mismatch; align by min length
-            min_len = min(enc_len, mask_len)
-            encoder_outputs.last_hidden_state = encoder_outputs.last_hidden_state[:, :min_len, :]
-            attention_mask_plus = attention_mask[:, :min_len]
+        e_mix = torch.matmul(p_for_token, self.strategy_embeddings.weight)  # [B,d]
 
         # 7) Decoder + LM loss via parent forward (use prepared encoder_outputs)
         lm_outputs: Seq2SeqLMOutput = super().forward(
             input_ids=None,  # prevent re-encoding
-            attention_mask=attention_mask_plus,
+            attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             head_mask=head_mask,
@@ -251,4 +233,254 @@ class BartForESCWithStrategy(BartForConditionalGeneration):
             strategy_probs=p_s,
         )
 
+
+
+# ========================= Dual Cross-Attention (MISC-style) =========================
+class StrategyAwareBartDecoderLayer(BartDecoderLayer):
+    """BartDecoderLayer 확장: 문맥 cross-attn과 별도의 전략 cross-attn을 추가한다.
+
+    - 기존 self-attn → encoder cross-attn 순서를 유지하고, 그 뒤에 strategy cross-attn을 수행한다.
+    - 전략 메모리는 길이 1의 시퀀스(e_mix)에 해당하며, 마스크는 생략 가능하다.
+    - 게이트 파라미터를 통해 전략 경로의 기여도를 학습적으로 조절한다.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        embed_dim = config.d_model
+        # 별도 전략 cross-attn: 현재 레이어의 encoder_attn과 완전히 동일한 구성으로 복제하여
+        # 버전 차이에 따른 시그니처 이슈를 피한다.
+        self.strategy_attn = copy.deepcopy(self.encoder_attn)
+        self.strategy_attn_layer_norm = nn.LayerNorm(embed_dim)
+        # 게이트는 (0,1) 범위로 사용하기 위해 시그모이드로 squashing
+        self.strategy_gate = nn.Parameter(torch.tensor(0.2))
+
+        # 레이어 호출 시 전략 메모리 컨텍스트를 임시로 주입하기 위한 버퍼
+        self._strategy_hidden_states: Optional[torch.Tensor] = None
+        self._strategy_attention_mask: Optional[torch.Tensor] = None
+
+        # 활성화/드롭아웃은 부모의 구성을 사용 (self.activation_fn 등)
+
+    def set_strategy_context(
+        self,
+        strategy_hidden_states: Optional[torch.Tensor],
+        strategy_attention_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._strategy_hidden_states = strategy_hidden_states
+        self._strategy_attention_mask = strategy_attention_mask
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
+        # ---- Self-Attention ----
+        residual = hidden_states
+        self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            past_key_value=self_attn_past_key_value,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        # ---- Encoder Cross-Attention ----
+        cross_attn_weights = None
+        cross_attn_present_key_value = None
+        if encoder_hidden_states is not None:
+            residual = hidden_states
+            encoder_attn_past_key_value = past_key_value[2:4] if past_key_value is not None else None
+            hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
+                hidden_states=hidden_states,
+                key_value_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=encoder_attn_past_key_value,
+                output_attentions=output_attentions,
+            )
+            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+            hidden_states = residual + hidden_states
+            hidden_states = self.encoder_attn_layer_norm(hidden_states)
+
+        # ---- Strategy Cross-Attention (length=1 memory) ----
+        if self._strategy_hidden_states is not None:
+            residual = hidden_states
+            strat_out, _, _ = self.strategy_attn(
+                hidden_states=hidden_states,
+                key_value_states=self._strategy_hidden_states,
+                attention_mask=self._strategy_attention_mask,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=None,
+                output_attentions=False,
+            )
+            gate = torch.sigmoid(self.strategy_gate)
+            strat_out = gate * strat_out
+            strat_out = nn.functional.dropout(strat_out, p=self.dropout, training=self.training)
+            hidden_states = residual + strat_out
+            hidden_states = self.strategy_attn_layer_norm(hidden_states)
+
+        # ---- FFN ----
+        residual = hidden_states
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        # 캐시는 상위에서 비활성화했으나, 호출 호환성을 위해 방어적 처리 유지
+        if use_cache and present_key_value is not None and cross_attn_present_key_value is not None:
+            present_key_value = present_key_value + cross_attn_present_key_value
+        elif use_cache and present_key_value is not None:
+            present_key_value = present_key_value
+        else:
+            present_key_value = None
+
+        return hidden_states, self_attn_weights, cross_attn_weights, present_key_value
+
+
+class BartForESCWithStrategyDualAttn(BartForESCWithStrategy):
+    """MISC 스타일: 디코더 레이어마다 전략용 cross-attn을 추가한 모델.
+
+    - `BartForESCWithStrategy`의 전략 추정/로스 경로는 유지.
+    - 인코더 출력 뒤 concat은 하지 않으며, 전략 벡터는 별도 cross-attn 메모리로 주입.
+    - 생성 경로에서는 `prepare_encoder_decoder_kwargs_for_generation`에서 전략 메모리를 전달한다.
+    """
+
+    def __init__(self, config, num_strategies: int = 8, **kwargs):
+        super().__init__(config, num_strategies=num_strategies, **kwargs)
+        # 디코더 레이어를 전략-aware 레이어로 교체
+        new_layers = nn.ModuleList()
+        for old in self.model.decoder.layers:
+            new_layer = StrategyAwareBartDecoderLayer(config)
+            # 공통 가중치 복사 (존재하는 모듈만)
+            try:
+                new_layer.self_attn.load_state_dict(old.self_attn.state_dict())
+                if getattr(old, "encoder_attn", None) is not None:
+                    new_layer.encoder_attn.load_state_dict(old.encoder_attn.state_dict())
+                new_layer.self_attn_layer_norm.load_state_dict(old.self_attn_layer_norm.state_dict())
+                new_layer.encoder_attn_layer_norm.load_state_dict(old.encoder_attn_layer_norm.state_dict())
+                new_layer.fc1.load_state_dict(old.fc1.state_dict())
+                new_layer.fc2.load_state_dict(old.fc2.state_dict())
+                new_layer.final_layer_norm.load_state_dict(old.final_layer_norm.state_dict())
+            except Exception:
+                pass
+            new_layers.append(new_layer)
+        self.model.decoder.layers = new_layers
+
+    # generation 시 전략 메모리를 전달
+    def prepare_encoder_decoder_kwargs_for_generation(self, input_ids: torch.LongTensor, model_kwargs, **unused):  # type: ignore
+        model_kwargs = super().prepare_encoder_decoder_kwargs_for_generation(input_ids, model_kwargs, **unused)
+        encoder_outputs = model_kwargs.get("encoder_outputs")
+        last_hidden = encoder_outputs.last_hidden_state
+        h_cls = self._pool_bos(last_hidden)
+        logits_s = self.strategy_head(h_cls)
+        p_s = torch.softmax(logits_s, dim=-1)
+        e_mix = torch.matmul(p_s, self.strategy_embeddings.weight)  # [B,d]
+        # 길이 1 전략 메모리와 마스크 전달
+        model_kwargs["strategy_hidden_states"] = e_mix.unsqueeze(1)  # [B,1,d]
+        model_kwargs["strategy_attention_mask"] = None
+        return model_kwargs
+
+    def _set_strategy_context_on_layers(self, strategy_hidden_states: Optional[torch.Tensor], strategy_attention_mask: Optional[torch.Tensor]) -> None:
+        for layer in self.model.decoder.layers:
+            if isinstance(layer, StrategyAwareBartDecoderLayer):
+                layer.set_strategy_context(strategy_hidden_states, strategy_attention_mask)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        decoder_inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+        strategy_labels: Optional[torch.Tensor] = None,
+        strategy_hidden_states: Optional[torch.Tensor] = None,
+        strategy_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> StrategySeq2SeqOutput:  # type: ignore
+        # strategy_hidden_states가 주어지지 않으면 현재 배치에서 계산
+        if strategy_hidden_states is None:
+            if encoder_outputs is None:
+                encoder_outputs = self.model.encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                )
+            enc_last_hidden = encoder_outputs.last_hidden_state
+            h_cls = self._pool_bos(enc_last_hidden)
+            logits_s = self.strategy_head(h_cls)
+            p_s = torch.softmax(logits_s, dim=-1)
+            p_mix = p_s
+            if self.training and strategy_labels is not None:
+                valid = (strategy_labels >= 0) & (strategy_labels < self.num_strategies)
+                if valid.any():
+                    if self.use_ground_truth_strategy:
+                        p_mix = p_mix.clone()
+                        p_mix[valid] = nn.functional.one_hot(strategy_labels[valid], num_classes=self.num_strategies).float()
+                    else:
+                        oh = nn.functional.one_hot(strategy_labels[valid], num_classes=self.num_strategies).float()
+                        p_mix = p_mix.clone()
+                        p_mix_valid = self.alpha * p_s[valid] + (1.0 - self.alpha) * oh
+                        p_mix[valid] = p_mix_valid
+            if self.training and self.global_step < int(self.detach_steps):
+                p_for_token = p_mix.detach()
+            else:
+                p_for_token = p_mix
+            e_mix = torch.matmul(p_for_token, self.strategy_embeddings.weight)
+            strategy_hidden_states = e_mix.unsqueeze(1)
+            strategy_attention_mask = None
+
+        # 레이어에 전략 컨텍스트 주입
+        self._set_strategy_context_on_layers(strategy_hidden_states, strategy_attention_mask)
+        try:
+            # 부모 클래스의 forward를 호출하여 LM/CLS 경로 유지
+            out = super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                head_mask=head_mask,
+                decoder_head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                encoder_outputs=encoder_outputs,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                strategy_labels=strategy_labels,
+            )
+        finally:
+            # 컨텍스트 정리 (메모리 누수/캐시 오염 방지)
+            self._set_strategy_context_on_layers(None, None)
+        return out
 
