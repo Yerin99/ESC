@@ -8,6 +8,7 @@ DATASET_REGISTRY: Dict[str, tuple[str, str]] = {
     # name: (module_path, class_name)
     "pure_esconv": ("utils.pure_esconv_dataset", "PureESConvDataset"),
     "strategy_esconv": ("utils.strategy_esconv_dataset", "StrategyESConvDataset"),
+    "strategy_all_esconv": ("utils.strategy_all_esconv_dataset", "StrategyAllESConvDataset"),
     "situation_esconv": ("utils.situation_esconv_dataset", "SituationESConvDataset"),
     "emotion_type_esconv": ("utils.emotion_type_esconv_dataset", "EmotionTypeESConvDataset"),
     "problem_type_esconv": ("utils.problem_type_esconv_dataset", "ProblemTypeESConvDataset"),
