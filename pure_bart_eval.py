@@ -13,6 +13,8 @@ CUDA_VISIBLE_DEVICES=0 python pure_bart_eval.py --checkpoint_dir outputs/pure_ba
 
 CUDA_VISIBLE_DEVICES=0 python pure_bart_eval.py --checkpoint_dir outputs/problem_type_bart/checkpoint-XXXX --output_dir outputs/problem_type_bart
 
+CUDA_VISIBLE_DEVICES=1 python pure_bart_eval.py --checkpoint_dir outputs/strategy_all_bart/checkpoint-XXXX --output_dir outputs/strategy_all_bart
+
 CUDA_VISIBLE_DEVICES=1 python pure_bart_eval.py --checkpoint_dir outputs/strategy_bart/checkpoint-XXXX --output_dir outputs/strategy_bart
 
 CUDA_VISIBLE_DEVICES=2 python pure_bart_eval.py --checkpoint_dir outputs/situation_bart/checkpoint-XXXX --output_dir outputs/situation_bart
@@ -77,9 +79,17 @@ def build_compute_metrics(tokenizer: BartTokenizer):
             ref_ids = labels[i]
             ref_first_id = next((int(t) for t in ref_ids if t != -100 and t != tokenizer.pad_token_id), None)
             pred_seq = preds[i]
+            # skip decoder_start_token_id once, then skip BOS/PAD
+            # In BART, decoder_start_token_id == eos_token_id. Use tokenizer to avoid trainer reference.
+            start_id = tokenizer.eos_token_id
+            first_seen = True
             pred_iter = (int(t) for t in pred_seq)
             pred_first_id = None
             for t in pred_iter:
+                if first_seen and start_id is not None and t == start_id:
+                    first_seen = False
+                    continue
+                first_seen = False
                 if tokenizer.bos_token_id is not None and t == tokenizer.bos_token_id:
                     continue
                 if t == tokenizer.pad_token_id:
@@ -108,6 +118,8 @@ def build_compute_metrics(tokenizer: BartTokenizer):
             micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
             result["strat_f1_micro"] = (2 * micro_p * micro_r / (micro_p + micro_r)) if (micro_p + micro_r) > 0 else 0.0
             f1_list = []
+            f1_weighted_sum = 0.0
+            total_support = 0
             for tok in allowed_strat_tokens:
                 supp = tp[tok] + fn[tok]
                 if supp == 0:
@@ -116,8 +128,12 @@ def build_compute_metrics(tokenizer: BartTokenizer):
                 r_c = tp[tok] / (tp[tok] + fn[tok]) if (tp[tok] + fn[tok]) > 0 else 0.0
                 f1_c = (2 * p_c * r_c / (p_c + r_c)) if (p_c + r_c) > 0 else 0.0
                 f1_list.append(f1_c)
+                f1_weighted_sum += f1_c * supp
+                total_support += supp
             if f1_list:
                 result["strat_f1_macro"] = float(sum(f1_list) / len(f1_list))
+            if total_support > 0:
+                result["strat_f1_weighted"] = float(f1_weighted_sum / total_support)
         return {k: float(v) for k, v in result.items()}
 
     return compute_metrics
