@@ -50,16 +50,74 @@ def build_compute_metrics(tokenizer: BartTokenizer):
 
     The function replaces label -100 with PAD for decoding fairness.
     """
-    metric = Metric(toker=tokenizer)
+    # Prepare strategy token ids for robust first-token comparison
+    strategy_tokens = list(STRATEGY_TOKENS.values())
+    strategy_token_ids = set()
+    for tok in strategy_tokens:
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            strategy_token_ids.add(tid)
 
     def compute_metrics(eval_pred):
+        # Create a fresh Metric object at each evaluation call to avoid state carryover
+        metric = Metric(toker=tokenizer)
         preds, labels = eval_pred
-        labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
+        labels = np.array(labels)
         pred_texts = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        label_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        for ref, hyp in zip(label_texts, pred_texts):
+        label_texts = tokenizer.batch_decode(np.where(labels == -100, tokenizer.pad_token_id, labels), skip_special_tokens=True)
+
+        allowed_strat_tokens = set(strategy_tokens)
+        tp = {tok: 0 for tok in strategy_tokens}
+        fp = {tok: 0 for tok in strategy_tokens}
+        fn = {tok: 0 for tok in strategy_tokens}
+        strat_support_total = 0
+
+        for i, (ref, hyp) in enumerate(zip(label_texts, pred_texts)):
             metric.forword([ref], hyp)
+            ref_ids = labels[i]
+            ref_first_id = next((int(t) for t in ref_ids if t != -100 and t != tokenizer.pad_token_id), None)
+            pred_seq = preds[i]
+            pred_iter = (int(t) for t in pred_seq)
+            pred_first_id = None
+            for t in pred_iter:
+                if tokenizer.bos_token_id is not None and t == tokenizer.bos_token_id:
+                    continue
+                if t == tokenizer.pad_token_id:
+                    continue
+                pred_first_id = t
+                break
+
+            if ref_first_id in strategy_token_ids and ref_first_id is not None and pred_first_id is not None:
+                strat_support_total += 1
+                ref_first_tok = tokenizer.convert_ids_to_tokens(ref_first_id)
+                hyp_first_tok = tokenizer.convert_ids_to_tokens(pred_first_id)
+                if hyp_first_tok == ref_first_tok:
+                    tp[ref_first_tok] += 1
+                else:
+                    fn[ref_first_tok] += 1
+                    if hyp_first_tok in allowed_strat_tokens:
+                        fp[hyp_first_tok] += 1
+
         result, _ = metric.close()
+        if strat_support_total > 0:
+            total_tp = sum(tp.values())
+            total_fp = sum(fp.values())
+            total_fn = sum(fn.values())
+            result["strat_acc"] = total_tp / strat_support_total if strat_support_total else 0.0
+            micro_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            result["strat_f1_micro"] = (2 * micro_p * micro_r / (micro_p + micro_r)) if (micro_p + micro_r) > 0 else 0.0
+            f1_list = []
+            for tok in allowed_strat_tokens:
+                supp = tp[tok] + fn[tok]
+                if supp == 0:
+                    continue
+                p_c = tp[tok] / (tp[tok] + fp[tok]) if (tp[tok] + fp[tok]) > 0 else 0.0
+                r_c = tp[tok] / (tp[tok] + fn[tok]) if (tp[tok] + fn[tok]) > 0 else 0.0
+                f1_c = (2 * p_c * r_c / (p_c + r_c)) if (p_c + r_c) > 0 else 0.0
+                f1_list.append(f1_c)
+            if f1_list:
+                result["strat_f1_macro"] = float(sum(f1_list) / len(f1_list))
         return {k: float(v) for k, v in result.items()}
 
     return compute_metrics
@@ -155,7 +213,7 @@ def main() -> None:
     # Tokenizer & model
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     special_tokens = list(SPEAKER_TOKENS.values())
-    if args.dataset == "strategy_esconv":
+    if args.dataset in ("strategy_esconv", "strategy_all_esconv"):
         special_tokens += list(STRATEGY_TOKENS.values())
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
