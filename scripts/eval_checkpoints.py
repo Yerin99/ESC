@@ -63,11 +63,11 @@ def _run_eval_for_checkpoint(
     repetition_penalty: float,
 ) -> None:
     """Invoke pure_bart_eval.py for a single checkpoint, writing metrics into the checkpoint dir."""
-    import subprocess
+    import subprocess, sys
 
     script_path = Path(__file__).resolve().parents[1] / "pure_bart_eval.py"
     cmd: List[str] = [
-        "python",
+        sys.executable,
         str(script_path),
         "--checkpoint_dir",
         str(checkpoint_dir),
