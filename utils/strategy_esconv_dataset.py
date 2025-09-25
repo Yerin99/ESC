@@ -68,7 +68,9 @@ class StrategyESConvDataset(torch.utils.data.Dataset):
                 if not context_text.strip():
                     continue
 
-                # Tokenize source/target
+                # Tokenize source/target with left truncation for context
+                old_side = tokenizer.truncation_side
+                tokenizer.truncation_side = "left"
                 enc = tokenizer(
                     context_text,
                     max_length=max_src,
@@ -76,6 +78,7 @@ class StrategyESConvDataset(torch.utils.data.Dataset):
                     padding="max_length",
                     add_special_tokens=False,
                 )
+                tokenizer.truncation_side = old_side
                 dec = tokenizer(
                     turn["text"],
                     max_length=max_tgt,
